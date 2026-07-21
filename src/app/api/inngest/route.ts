@@ -1,8 +1,8 @@
 import { serve } from "inngest/next";
 import { inngest } from "../../../inngest/client";
+import { runAgentFn } from "../../../inngest/runAgent";
 
-// The agent function will be added here in Phase 7.
 export const { GET, POST, PUT } = serve({
   client: inngest,
-  functions: [],
+  functions: [runAgentFn],
 });
