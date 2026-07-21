@@ -3,9 +3,9 @@ import type { ContentBlock, MessageParam } from "@anthropic-ai/sdk/resources/mes
 import { inngest } from "./client";
 import { supabaseAdmin } from "../lib/supabase/admin";
 import { toolDefinitions, runTool } from "../lib/tools";
+import { runAgentIterations, type ToolUseBlock } from "../lib/agentLoop";
 
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
-const MAX_ITERATIONS = 6;
 
 function getAnthropicClient() {
   return new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -68,17 +68,18 @@ export const runAgentFn = inngest.createFunction(
         await insertStep(runId, stepIdx++, "plan", "Plan", planText);
       });
 
-      const messages: MessageParam[] = [
+      const initialMessages: MessageParam[] = [
         {
           role: "user",
           content: `Task: "${task}"\n\nYour plan: ${planText}\n\nNow work through the task. Use the fetch_url tool if you need to read a web page. When you are done, provide your final answer as plain text with no further tool calls.`,
         },
       ];
 
-      let finalAnswer: string | null = null;
-
-      for (let i = 0; i < MAX_ITERATIONS && finalAnswer === null; i++) {
-        const response = await step.run(`iter-${i}`, async () => {
+      const { finalAnswer } = await runAgentIterations(initialMessages, {
+        // Inngest's real step.run return type is wrapped in `Jsonify<...>` for
+        // checkpointing; structurally it still behaves as `run(id, fn): Promise<T>`.
+        step: step as unknown as import("../lib/agentLoop").StepLike,
+        createMessage: (messages) => {
           const anthropic = getAnthropicClient();
           return anthropic.messages.create({
             model: MODEL,
@@ -86,81 +87,41 @@ export const runAgentFn = inngest.createFunction(
             tools: toolDefinitions,
             messages,
           });
-        });
-
-        const toolUseBlocks = response.content.filter(
-          (b: ContentBlock) => b.type === "tool_use"
-        ) as Array<{ type: "tool_use"; id: string; name: string; input: Record<string, unknown> }>;
-
-        messages.push({ role: "assistant", content: response.content });
-
-        if (toolUseBlocks.length === 0 || response.stop_reason !== "tool_use") {
-          const text = response.content
-            .filter((b: ContentBlock) => b.type === "text")
-            .map((b) => (b as { text: string }).text)
-            .join("\n");
-          finalAnswer = text || "(agent returned no final text)";
-          break;
-        }
-
-        const toolResultContent: Array<{
-          type: "tool_result";
-          tool_use_id: string;
-          content: string;
-          is_error?: boolean;
-        }> = [];
-
-        for (const toolUse of toolUseBlocks) {
-          await step.run(`insert-tool-call-${i}-${toolUse.id}`, async () => {
-            await insertStep(
-              runId,
-              stepIdx++,
-              "tool_call",
-              `Calling ${toolUse.name}`,
-              JSON.stringify(toolUse.input)
-            );
-          });
-
-          const result = await step.run(`tool-exec-${i}-${toolUse.id}`, async () => {
-            try {
-              const output = await runTool(toolUse.name, toolUse.input);
-              return { ok: true as const, output };
-            } catch (err) {
-              return {
-                ok: false as const,
-                output: err instanceof Error ? err.message : String(err),
-              };
-            }
-          });
-
-          await step.run(`insert-tool-result-${i}-${toolUse.id}`, async () => {
-            await insertStep(
-              runId,
-              stepIdx++,
-              "tool_result",
-              result.ok ? `Result from ${toolUse.name}` : `Error from ${toolUse.name}`,
-              result.output
-            );
-          });
-
-          toolResultContent.push({
-            type: "tool_result",
-            tool_use_id: toolUse.id,
-            content: result.output,
-            is_error: !result.ok,
-          });
-        }
-
-        messages.push({ role: "user", content: toolResultContent });
-      }
-
-      if (finalAnswer === null) {
-        finalAnswer =
-          "(reached maximum iterations without a final answer; see step trace for details)";
-      }
+        },
+        executeTool: async (name, input) => {
+          try {
+            const output = await runTool(name, input);
+            return { ok: true, output };
+          } catch (err) {
+            return { ok: false, output: err instanceof Error ? err.message : String(err) };
+          }
+        },
+        onToolCall: async (_iterationIndex: number, toolUse: ToolUseBlock) => {
+          await insertStep(
+            runId,
+            stepIdx++,
+            "tool_call",
+            `Calling ${toolUse.name}`,
+            JSON.stringify(toolUse.input)
+          );
+        },
+        onToolResult: async (
+          _iterationIndex: number,
+          toolUse: ToolUseBlock,
+          result: { ok: boolean; output: string }
+        ) => {
+          await insertStep(
+            runId,
+            stepIdx++,
+            "tool_result",
+            result.ok ? `Result from ${toolUse.name}` : `Error from ${toolUse.name}`,
+            result.output
+          );
+        },
+      });
 
       await step.run("finalize", async () => {
-        await insertStep(runId, stepIdx++, "final", "Final answer", finalAnswer as string);
+        await insertStep(runId, stepIdx++, "final", "Final answer", finalAnswer);
         const { error } = await supabaseAdmin
           .from("runs")
           .update({
